@@ -224,6 +224,10 @@ static int extract_url (const char *url, int default_port,
         if (!request->host || !request->path)
                 goto ERROR_EXIT;
 
+        /* e.g. "http:///" or "CONNECT /foo" */
+        if (!*request->host)
+                goto ERROR_EXIT;
+
         /* Remove the username/password if they're present */
         strip_username_password (request->host);
 
@@ -240,6 +244,10 @@ static int extract_url (const char *url, int default_port,
                 p--;
                 *p = '\0';
         }
+
+        /* e.g. "http://user@/", "http://:8080/" or "http://[]/" */
+        if (!*request->host)
+                goto ERROR_EXIT;
 
         return 0;
 
@@ -423,6 +431,7 @@ got_stathost:
                                 char buf[PATH_MAX];
                                 snprintf (buf, sizeof buf, "Location: %s\r\n", reverse_url);
                                 send_http_headers (connptr, 301, "Moved Permanently", buf);
+                                safefree (reverse_url);
                                 goto fail;
                         }
                         safefree (url);
@@ -619,6 +628,14 @@ static int add_xtinyproxy_header (struct conn_s *connptr)
 }
 #endif /* XTINYPROXY */
 
+static int
+check_duplicate_header (pseudomap *hashofheaders, char *header, const char* kw)
+{
+        return (!strcasecmp(header, kw) &&
+            pseudomap_find (hashofheaders, kw));
+}
+
+
 /*
  * Take a complete header line and break it apart (into a key and the data.)
  * Now insert this information into the hashmap for the connection so it
@@ -627,25 +644,31 @@ static int add_xtinyproxy_header (struct conn_s *connptr)
 static int
 add_header_to_connection (pseudomap *hashofheaders, char *header, size_t len)
 {
-        char *sep;
+        char *sep, *p;
 
         /* Get rid of the new line and return at the end */
-        len -= chomp (header, len);
+        (void) chomp (header, len);
 
         sep = strchr (header, ':');
         if (!sep)
                 return 0; /* just skip invalid header, do not give error */
 
+        /* Remove any trailing whitespace before colon */
+        if (sep == header)
+                return 0;
+        p = sep;
+        while (p > header && (p[-1] == ' ' || p[-1] == '\t'))
+                *--p = '\0';
+        if (*header == '\0')
+                return 0;
+
         /* Blank out colons, spaces, and tabs. */
         while (*sep == ':' || *sep == ' ' || *sep == '\t')
                 *sep++ = '\0';
 
-        /* Calculate the new length of just the data */
-        len -= sep - header - 1;
-
-        /* prevent multiple content-length headers from being inserted */
-        if (!strcasecmp(header, "content-length") &&
-            pseudomap_find (hashofheaders, "content-length"))
+        /* prevent multiple CL/TE headers from being inserted */
+        if (check_duplicate_header(hashofheaders, header, "content-length") ||
+            check_duplicate_header(hashofheaders, header, "transfer-encoding"))
                 return 0;
 
         return pseudomap_append (hashofheaders, header, sep);
@@ -760,6 +783,14 @@ static int remove_connection_headers (pseudomap *hashofheaders)
                 "connection",
                 "proxy-connection"
         };
+        /* message framing headers which must never be removed by a
+           Connection option, otherwise the body we forward according
+           to the precomputed length is no longer delimited for the
+           receiver (request/response smuggling). */
+        static const char *protected_headers[] = {
+                "content-length",
+                "transfer-encoding"
+        };
 
         char *data;
         char *ptr;
@@ -767,11 +798,12 @@ static int remove_connection_headers (pseudomap *hashofheaders)
         int i,j,df;
 
         for (i = 0; i != (sizeof (headers) / sizeof (char *)); ++i) {
-                /* Look for the connection header.  If it's not found, return. */
+                /* Look for the connection header.  If it's not found,
+                   check the next one. */
                 data = pseudomap_find(hashofheaders, headers[i]);
 
                 if (!data)
-                        return 0;
+                        continue;
 
                 len = strlen(data);
 
@@ -794,6 +826,8 @@ static int remove_connection_headers (pseudomap *hashofheaders)
                            double-free (CVE-2023-49606) */
                         for (j = 0; j != (sizeof (headers) / sizeof (char *)); ++j)
                                 if(!strcasecmp(ptr, headers[j])) df = 1;
+                        for (j = 0; j != (sizeof (protected_headers) / sizeof (char *)); ++j)
+                                if(!strcasecmp(ptr, protected_headers[j])) df = 1;
                         if (!df) pseudomap_remove (hashofheaders, ptr);
 
                         /* Advance ptr to the next token */
@@ -826,11 +860,49 @@ static long get_content_length (pseudomap *hashofheaders)
         return content_length;
 }
 
-static int is_chunked_transfer (pseudomap *hashofheaders)
-{
+/* In-place sanitize the Transfer-Encoding value by removing superfluous
+   whitespace.
+   Returns 1 if a valid trailing "chunked" transfer-coding is present.
+   Returns -1 if "chunked" is present but malformed / not final; otherwise 0. */
+static int
+check_chunked_and_sanitize_transfer_encoding(pseudomap *hashofheaders) {
         char *data;
+        int was_comma = 0, ret = 0, c;
+        char *ins, *p, *chunked = 0;
         data = pseudomap_find (hashofheaders, "transfer-encoding");
-        return data ? !strcasecmp (data, "chunked") : 0;
+        if (!data) return 0;
+        ins = p = data;
+        while (*p) {
+                c = *(p++);
+                switch (c) {
+                case ',':
+                        if (was_comma || chunked || ins == data) ret = -1;
+                        if (!was_comma) *(ins++) = c;
+                        was_comma = 1;
+                        break;
+                case '\t': case ' ':
+                        if (was_comma) {
+                                if (was_comma == 1) *(ins++) = ' ';
+                                ++was_comma;
+                        } else was_comma = 0;
+                        break;
+                case 'C': case 'c':
+                        if (!strncasecmp(p, "hunked", 6)) {
+                                if (chunked || !(was_comma || ins == data))
+                                        ret = -1;
+                                chunked = ins;
+                        }
+                        /* fall-through */
+                default:
+                        was_comma = 0;
+                        *(ins++) = c;
+                }
+        }
+        *ins = 0;
+        if (ret == -1) return ret;
+        /* after sanitization, if chunked was found, it needs to be the final coding */
+        if (chunked && (chunked[7] == 0 || chunked[7] == ';')) return 1;
+        return 0;
 }
 
 /*
@@ -921,8 +993,15 @@ process_client_headers (struct conn_s *connptr, pseudomap *hashofheaders)
          */
         connptr->content_length.client = get_content_length (hashofheaders);
 
-        /* Check whether client sends chunked data. */
-        if (is_chunked_transfer (hashofheaders)) {
+        ret = check_chunked_and_sanitize_transfer_encoding(hashofheaders);
+        if (ret == -1) {
+                /* bad transfer-encoding: RFC 9112 6.1 */
+                indicate_http_error (connptr, 400,
+                                     "Bad Request",
+                                     NULL);
+                goto PULL_CLIENT_DATA;
+        } else if (ret == 1) {
+                /* well-formatted "chunked" transfer-encoding */
                 if (connptr->content_length.client != -1)
                         /* request smuggling, see GH issue #609 */
                         pseudomap_remove (hashofheaders, "content-length");
@@ -1664,9 +1743,9 @@ void handle_connection (struct conn_s *connptr, union sockaddr_union* addr)
                         auth_error(connptr, stathost_connect ? 401 : 407);
                         HC_FAIL();
                 }
-                if ( /* currently only "basic" auth supported */
-                        (strncmp(authstring, "Basic ", 6) == 0 ||
-                         strncmp(authstring, "basic ", 6) == 0) &&
+                if ( /* currently only "basic" auth supported,
+                        scheme is case-insensitive (RFC 7235 2.1) */
+                        strncasecmp(authstring, "Basic ", 6) == 0 &&
                         basicauth_check (config->basicauth_list, authstring + 6) == 1)
                                 failure = 0;
                 if(failure) {
